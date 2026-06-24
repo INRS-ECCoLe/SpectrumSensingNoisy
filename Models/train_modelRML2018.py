@@ -27,7 +27,7 @@ CONFIG = {
     'epochs': 150,           # Restored to 150
     'learning_rate': 0.001,
     'test_size': 0.2,        # Restored explicit test size
-    'results_dir': 'results_narval_snr_analysis_RML2018', # Restored specific dir name
+    'results_dir': 'results_RML2018_Reviewer1', # Restored specific dir name
     'model_base_path': 'rml2018_model_',
     # Callback Settings (Restored)
     'early_stopping_patience': 15,
