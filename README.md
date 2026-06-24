@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/24627218/README.md)
 # **Deep Learning–Based Spectrum Sensing Using RML2016, RML2018, HisarMod2019, and PanoRadioHF Dataset**
 
 ## **Overview**
@@ -13,7 +12,7 @@ This project establishes a framework for robust, low-SNR, privacy-preserving spe
 * **Problem Definition:** The learning objective is redefined as a binary classification task:  
   * **H0:** Idle channel (Noise only)  
   * **H1:** Occupied channel (Signal \+ Noise)  
-* **Data Augmentation:** AWGN-only samples are synthetically generated to represent idle channels (H0) to balance the datasets.
+* **Data Augmentation:** Realistic noise Thermal Noise (AWGN), Colored Noise, Narrowband Interference (NBI) and Impulsive Noise generated to represent idle channels (H0) to balance the datasets.
 
 ## **Phase 2: Robustness Analysis**
 
