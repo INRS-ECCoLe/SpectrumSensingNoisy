@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, roc_curve, auc, precision_score, recall_score, f1_score
-import scipy.signal
+import scipy.signal as signal # Ensured correct import for signal processing
 import time
 import os
 import json
@@ -28,7 +28,7 @@ CONFIG = {
     'epochs': 150,
     'learning_rate': 0.001,
     'test_size': 0.2,
-    'results_dir': 'results_narval_snr_analysis_RML2016b',
+    'results_dir': 'results_RML2016b_Reviewer1',
     'model_base_path': 'pytorch_model_',
     # Callback Settings
     'early_stopping_patience': 15,
@@ -44,6 +44,54 @@ os.makedirs(CONFIG['results_dir'], exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[Info] Using device: {DEVICE}")
 
+
+# ==========================================
+# REALISTIC RF BACKGROUND SIMULATOR 
+# ==========================================
+def generate_complex_rf_background(shape):
+    """
+    Generates realistic idle-channel data incorporating AWGN, Colored Noise, 
+    Narrowband Interference (NBI), and Impulsive Noise.
+    This replaces pure AWGN to properly test model generalization.
+    """
+    N, length, channels = shape
+    t = np.arange(length)
+    
+    # 1. Base Thermal Noise (AWGN)
+    awgn = np.random.normal(0, 1.0, shape)
+    
+    # 2. Colored Noise (Simulates RF Front-End filters)
+    # Applying a Butterworth low-pass filter to AWGN
+    b, a = signal.butter(4, 0.4, 'low')
+    colored_noise = signal.lfilter(b, a, np.random.normal(0, 1.0, shape), axis=1)
+    
+    # 3. Narrowband Interference (NBI) / Adjacent Channel Leakage
+    nbi = np.zeros_like(awgn)
+    for i in range(N):
+        # 30% chance an idle channel contains a strong narrowband interferer
+        if np.random.rand() > 0.7:
+            f = np.random.uniform(0.01, 0.4) # Random normalized frequency
+            phase = np.random.uniform(0, 2 * np.pi)
+            nbi[i, :, 0] = np.cos(2 * np.pi * f * t + phase)
+            nbi[i, :, 1] = np.sin(2 * np.pi * f * t + phase)
+            
+    # 4. Impulsive Noise (Simulates environmental static/transients)
+    # Sparse spikes (approx 1% of samples get a spike)
+    spikes = np.random.choice([0, 1], size=shape, p=[0.99, 0.01]) * np.random.normal(0, 3.0, shape)
+    
+    # Mix components with random dynamic weights to create a highly varied background
+    w_awgn = np.random.uniform(0.4, 1.0, (N, 1, 1))
+    w_col = np.random.uniform(0.2, 0.8, (N, 1, 1))
+    w_nbi = np.random.uniform(0.1, 0.5, (N, 1, 1))
+    
+    complex_noise = (w_awgn * awgn) + (w_col * colored_noise) + (w_nbi * nbi) + spikes
+    
+    # Normalize noise variance to match dataset's expected input ranges prior to global norm
+    complex_noise = complex_noise / np.std(complex_noise, axis=(1, 2), keepdims=True)
+    
+    return complex_noise
+
+
 # ==========================================
 # DATA LOADING (SNR AWARE)
 # ==========================================
@@ -53,7 +101,7 @@ def load_rml2016_dataset(path):
     Returns: X, y, snr_labels
     """
     if not os.path.exists(path):
-        raise FileNotFoundError(f"Dataset not found at {path}. Please upload 'RML2016a.dat'.")
+        raise FileNotFoundError(f"Dataset not found at {path}. Please upload 'RML2016a.dat' or 'RML2016b.dat'.")
 
     print(f"[Data] Loading RML2016 dataset from {path}...")
     
@@ -86,9 +134,11 @@ def load_rml2016_dataset(path):
     # Generate H0 (Noise) to balance the dataset
     # We assign H0 samples the same SNR labels as the H1 samples 
     # to allow "Per SNR" evaluation (detecting signal vs noise at that specific SNR level)
-    print(f"[Data] Generating {n_samples_h1} synthetic H0 samples...")
-    noise_power = 0.001
-    X_h0 = np.random.normal(0, np.sqrt(noise_power), (n_samples_h1, 128, 2))
+    print(f"[Data] Generating {n_samples_h1} realistic H0 samples (AWGN + NBI + Colored Noise)...")
+    
+    # REPLACED PURE AWGN WITH COMPLEX RF BACKGROUND
+    X_h0 = generate_complex_rf_background(X_h1.shape)
+    
     y_h0 = np.zeros(n_samples_h1)
     snr_h0 = snr_h1.copy() # Match SNRs for balanced evaluation buckets
     
@@ -153,41 +203,6 @@ class CNN2Model(nn.Module):
         x = self.relu(self.fc1(x))
         x = self.fc2(x)
         return x
-
-class MCLDNNModel(nn.Module):
-    def __init__(self, num_classes=2):
-        super(MCLDNNModel, self).__init__()
-        self.conv1_1 = nn.Conv2d(1, 50, kernel_size=(2, 8), padding='same')
-        self.conv1_2 = nn.Conv1d(1, 50, kernel_size=8, padding='same')
-        self.conv1_3 = nn.Conv1d(1, 50, kernel_size=8, padding='same')
-        self.fusion_fc = nn.Linear(50 * 2 * 128 + 50 * 128 + 50 * 128, 124 * 100)
-        self.lstm1 = nn.LSTM(100, 128, batch_first=True)
-        self.lstm2 = nn.LSTM(128, 128, batch_first=True)
-        self.fc1 = nn.Linear(128, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.out = nn.Linear(128, num_classes)
-        self.selu = nn.SELU()
-        self.drop = nn.Dropout(0.5)
-
-    def forward(self, x):
-        i1 = x.permute(0, 2, 1).unsqueeze(1)
-        i2 = x[:, :, 0].unsqueeze(1)
-        i3 = x[:, :, 1].unsqueeze(1)
-        x1 = torch.relu(self.conv1_1(i1))
-        x2 = torch.relu(self.conv1_2(i2))
-        x3 = torch.relu(self.conv1_3(i3))
-        f1 = x1.flatten(start_dim=1)
-        f2 = x2.flatten(start_dim=1)
-        f3 = x3.flatten(start_dim=1)
-        merged = torch.cat([f1, f2, f3], dim=1)
-        merged = self.fusion_fc(merged)
-        merged = merged.view(-1, 124, 100)
-        lstm_out, _ = self.lstm1(merged)
-        lstm_out, _ = self.lstm2(lstm_out)
-        lstm_last = lstm_out[:, -1, :]
-        d = self.drop(self.selu(self.fc1(lstm_last)))
-        d = self.drop(self.selu(self.fc2(d)))
-        return self.out(d)
 
 class PETCGDNNModel(nn.Module):
     def __init__(self, num_classes=2):
@@ -368,12 +383,12 @@ def run_experiment(model_name, train_loader, test_loader):
     if model_name == 'LSTM': model = LSTMModel().to(DEVICE)
     elif model_name == 'GRU': model = GRUModel().to(DEVICE)
     elif model_name == 'CNN': model = CNN2Model().to(DEVICE)
-    elif model_name == 'MCLDNN': model = MCLDNNModel().to(DEVICE)
     elif model_name == 'PETCGDNN': model = PETCGDNNModel().to(DEVICE)
     else: raise ValueError("Unknown model")
         
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
+    
     # Removed verbose=True due to TypeError in newer PyTorch versions
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=CONFIG['lr_scheduler_factor'], patience=CONFIG['lr_scheduler_patience'], min_lr=CONFIG['min_lr'])
     
@@ -449,11 +464,13 @@ def save_consolidated_csv(all_results):
                 writer.writerow(row)
     print(f"[Success] Data saved to {filepath}")
 
+
 if __name__ == "__main__":
     try:
         X, y, snr = load_rml2016_dataset(CONFIG['dataset_path'])
         
-        # Normalize
+        # Normalize (Per-Sample Energy Normalization)
+        print("[Data] Normalizing...")
         energy = np.sum(np.abs(X)**2, axis=(1, 2), keepdims=True)
         X = X / (np.sqrt(energy / (128*2)) + 1e-10)
         
@@ -480,12 +497,17 @@ if __name__ == "__main__":
             pin_memory=CONFIG['pin_memory']
         )
         
-        models_list = ['LSTM', 'GRU', 'CNN', 'MCLDNN', 'PETCGDNN']
+        # MCLDNN removed from list
+        models_list = ['LSTM', 'GRU', 'CNN', 'PETCGDNN']
         all_model_results = {}
         
         for name in models_list:
             res, _ = run_experiment(name, train_loader, test_loader)
             all_model_results[name] = res
+            
+            import gc
+            gc.collect()
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
             
         save_consolidated_csv(all_model_results)
         print("[Success] All results exported successfully.")
