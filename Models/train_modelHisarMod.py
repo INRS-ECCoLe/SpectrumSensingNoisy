@@ -3,6 +3,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import confusion_matrix, roc_curve, auc, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
+import scipy.signal as signal # Added for Colored Noise Generation
 import time
 import os
 import warnings
@@ -48,12 +51,54 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[Info] Using device: {DEVICE}")
 
 # ==========================================
+# REALISTIC RF BACKGROUND SIMULATOR 
+# ==========================================
+def generate_complex_rf_background(shape):
+    """
+    Generates realistic idle-channel data incorporating AWGN, Colored Noise, 
+    Narrowband Interference (NBI), and Impulsive Noise.
+    Applied uniformly to H0 across all datasets.
+    """
+    N, length, channels = shape
+    t = np.arange(length)
+    
+    # 1. Base Thermal Noise (AWGN)
+    awgn = np.random.normal(0, 1.0, shape)
+    
+    # 2. Colored Noise (Simulates RF Front-End filters)
+    b, a = signal.butter(4, 0.4, 'low')
+    colored_noise = signal.lfilter(b, a, np.random.normal(0, 1.0, shape), axis=1)
+    
+    # 3. Narrowband Interference (NBI) / Adjacent Channel Leakage
+    nbi = np.zeros_like(awgn)
+    for i in range(N):
+        if np.random.rand() > 0.7:
+            f = np.random.uniform(0.01, 0.4) 
+            phase = np.random.uniform(0, 2 * np.pi)
+            nbi[i, :, 0] = np.cos(2 * np.pi * f * t + phase)
+            nbi[i, :, 1] = np.sin(2 * np.pi * f * t + phase)
+            
+    # 4. Impulsive Noise (Simulates environmental static/transients)
+    spikes = np.random.choice([0, 1], size=shape, p=[0.99, 0.01]) * np.random.normal(0, 3.0, shape)
+    
+    # Mix components with random dynamic weights to create a highly varied background
+    w_awgn = np.random.uniform(0.4, 1.0, (N, 1, 1))
+    w_col = np.random.uniform(0.2, 0.8, (N, 1, 1))
+    w_nbi = np.random.uniform(0.1, 0.5, (N, 1, 1))
+    
+    complex_noise = (w_awgn * awgn) + (w_col * colored_noise) + (w_nbi * nbi) + spikes
+    
+    # Normalize noise variance 
+    complex_noise = complex_noise / (np.std(complex_noise, axis=(1, 2), keepdims=True) + 1e-10)
+    
+    return complex_noise
+
+# ==========================================
 # DATA LOADING (CSV PAIRS)
 # ==========================================
 def load_hisarmod_subset(data_path, snr_path, limit=None, is_test=False):
     """
-    Loads a subset (Train or Test) from CSV files.
-    Returns X, y, snr.
+    Loads a subset (Train or Test) from CSV files securely, stratifying by SNR.
     """
     if not os.path.exists(data_path):
         raise FileNotFoundError(f"Data file not found at {data_path}")
@@ -63,112 +108,94 @@ def load_hisarmod_subset(data_path, snr_path, limit=None, is_test=False):
     subset_name = "TEST" if is_test else "TRAIN"
     print(f"\n[Data] Loading {subset_name} subset...")
 
-    # --- Load SNR Labels ---
-    print(f"[Data] Reading SNR labels from {snr_path}...")
+    # --- Load SNR Labels First (To properly stratify across the whole dataset) ---
+    print(f"[Data] Reading full SNR labels from {snr_path} to ensure balanced sampling...")
     try:
-        # Load SNR. Assuming simple CSV with one column or 'snr' header
-        df_snr = pd.read_csv(snr_path, nrows=limit)
-        # Check if it has a header or just values
+        df_snr = pd.read_csv(snr_path)
         if 'snr' in [c.lower() for c in df_snr.columns]:
-            # Find the column that looks like 'snr'
             col = next(c for c in df_snr.columns if c.lower().strip() == 'snr')
             snr_full = df_snr[col].values
         else:
-            # Assume first column is SNR if no header match
             snr_full = df_snr.iloc[:, 0].values
-            
-        print(f"[Data] Found {len(snr_full)} SNR labels.")
     except Exception as e:
         print(f"[Error] Failed to load SNR CSV: {e}")
         raise e
 
-    # --- Load IQ Data ---
-    # Load matching number of data rows
-    n_to_load = len(snr_full)
-    print(f"[Data] Reading IQ Data from {data_path} (Limit: {n_to_load})...")
-    
-    try:
-        # Load IQ data
-        df_data = pd.read_csv(data_path, nrows=n_to_load)
+    total_rows = len(snr_full)
+    print(f"[Data] Found {total_rows} total labels in CSV.")
+
+    # --- Stratified Subsampling ---
+    # Fixes Issue 1: Prevent grabbing only -20dB to -6dB by randomly picking across all SNRs
+    if limit is not None and limit < total_rows:
+        print(f"[Data] Stratified subsampling {limit} rows out of {total_rows} to save RAM...")
+        indices = np.arange(total_rows)
+        _, subset_idx = train_test_split(indices, test_size=limit, stratify=snr_full, random_state=42)
         
-        # --- Robust Type Conversion (Fix for 'str' error) ---
-        # Check if pandas loaded data as objects (strings)
-        if df_data.select_dtypes(include=['object']).shape[1] > 0:
+        subset_idx = np.sort(subset_idx) # Essential for skiprows logic
+        snr_full = snr_full[subset_idx]
+        
+        # Pandas skiprows takes a set of indices to skip. (Header is row 0)
+        keep_rows = set(subset_idx + 1)
+        keep_rows.add(0) 
+        
+        print(f"[Data] Streaming IQ Data from {data_path} (skipping unneeded rows)...")
+        df_data = pd.read_csv(data_path, skiprows=lambda x: x not in keep_rows)
+    else:
+        print(f"[Data] Loading full IQ Data from {data_path}...")
+        df_data = pd.read_csv(data_path)
+
+    # --- Robust Type Conversion ---
+    try:
+        # Silencing Pandas4Warning by explicitly including 'str' along with 'object'
+        if df_data.select_dtypes(include=['object', 'str']).shape[1] > 0:
             print("[Data] Detected non-numeric data (strings). Attempting conversion...")
-            # Convert values to numpy array of strings first
             vals = df_data.values.astype(str)
             
-            # Check for MATLAB-style complex format (e.g., '1.0000+2.0000i') by checking first element
             sample_val = vals[0, 0] if vals.size > 0 else ""
             if 'i' in sample_val or 'j' in sample_val:
-                print("[Data] Converting complex strings (MATLAB format 'i' -> 'j')...")
-                vals = np.char.replace(vals, 'i', 'j') # Python requires 'j' for complex
-                vals = np.char.replace(vals, ' ', '')  # Remove any accidental spaces
+                vals = np.char.replace(vals, 'i', 'j') 
+                vals = np.char.replace(vals, ' ', '')  
                 X_raw = vals.astype(np.complex128)
             else:
-                print("[Data] Converting string floats...")
                 X_raw = vals.astype(np.float32)
         else:
-            # Already numeric
             X_raw = df_data.values
-        
-        # Cleanup DataFrame to free memory
+            
         del df_data
         gc.collect()
-        
     except Exception as e:
         print(f"[Error] Failed to load Data CSV: {e}")
         raise e
 
-    # --- Alignment Check ---
-    if len(X_raw) != len(snr_full):
-        min_len = min(len(X_raw), len(snr_full))
-        print(f"[Warning] Mismatch in {subset_name}: Data {len(X_raw)} vs SNR {len(snr_full)}. Trimming to {min_len}.")
-        X_raw = X_raw[:min_len]
-        snr_full = snr_full[:min_len]
-
     # --- Reshaping ---
-    # Expected: (N, 1024, 2)
-    # Incoming likely: (N, 2048) or (N, 2, 1024)
-    # HisarMod: 1024 samples. 1024 * 2 = 2048 features.
-    
     n_samples = X_raw.shape[0]
     n_features = X_raw.shape[1]
-    
-    target_len = CONFIG['sample_len'] # 1024
+    target_len = CONFIG['sample_len'] 
     
     if n_features == target_len * 2:
-        # Likely flattened I/Q. Reshape to (N, 1024, 2)
-        print(f"[Data] Reshaping flattened data {X_raw.shape} to (N, {target_len}, 2)...")
-        # Assume first half is I, second half is Q (common export format)
         I = X_raw[:, :target_len]
         Q = X_raw[:, target_len:]
-        
-        # Ensure float32 if we have separated real components
         if np.iscomplexobj(I): I = I.real
         if np.iscomplexobj(Q): Q = Q.real
-        
-        X_h1 = np.stack([I, Q], axis=2).astype(np.float32) # (N, 1024, 2)
-        
+        X_h1 = np.stack([I, Q], axis=2).astype(np.float32) 
     elif n_features == target_len and np.iscomplexobj(X_raw):
-        # Complex support
-        print(f"[Data] Splitting complex data {X_raw.shape} into Real/Imag channels...")
         X_h1 = np.stack((X_raw.real, X_raw.imag), axis=2).astype(np.float32)
     else:
-        # Fallback reshape
-        print(f"[Warning] Data shape {X_raw.shape} doesn't match expected standard. Attempting best-effort reshape.")
-        if n_features % 2 == 0:
-             new_len = n_features // 2
-             CONFIG['sample_len'] = new_len
-             X_h1 = X_raw.reshape(n_samples, new_len, 2).astype(np.float32)
-        else:
-             raise ValueError(f"Cannot reshape {n_features} features into I/Q (must be even).")
+        print(f"[Warning] Reshaping fallback for shape {X_raw.shape}")
+        new_len = n_features // 2
+        CONFIG['sample_len'] = new_len
+        X_h1 = X_raw.reshape(n_samples, new_len, 2).astype(np.float32)
 
-    print(f"[Data] Loaded {X_h1.shape[0]} H1 (Signal) samples.")
+    print(f"[Data] Loaded {X_h1.shape[0]} base samples.")
 
     # --- Generate H0 (Noise) ---
-    print(f"[Data] Generating {n_samples} synthetic H0 (Noise) samples...")
-    X_h0 = np.random.normal(0, 1.0, X_h1.shape).astype(np.float32)
+    print(f"[Data] Generating realistic RF Channel Noise (AWGN + NBI + Transients) for H0...")
+    
+    # EXACT MATCH TO OTHER DATASETS:
+    # 1. H0 is synthesized using the complex RF background generator.
+    X_h0 = generate_complex_rf_background(X_h1.shape).astype(np.float32)
+    
+    # 2. H1 remains strictly the original dataset samples. No background is added to H1.
     
     y_h1 = np.ones(n_samples)
     y_h0 = np.zeros(n_samples)
@@ -226,7 +253,6 @@ class CNN2Model(nn.Module):
         self.conv4 = nn.Conv2d(64, 64, kernel_size=(2, 8), padding='same')
         
         # Dynamic Flatten Calculation
-        # 4 pooling layers of kernel (1,2) -> Length reduction factor 16
         final_len = CONFIG['sample_len'] // 16
         if final_len < 1: final_len = 1
         
@@ -334,8 +360,6 @@ def evaluate_by_snr(model, loader):
     
     unique_snrs = sorted(np.unique(all_snrs))
     results_by_snr = collections.defaultdict(dict)
-    
-    from sklearn.metrics import confusion_matrix, roc_curve, auc, precision_score, recall_score, f1_score
 
     for snr in unique_snrs:
         mask = (all_snrs == snr)
@@ -493,8 +517,8 @@ if __name__ == "__main__":
             is_test=True
         )
         
-        # Normalize (Using Train stats usually preferred, here per-subset for simplicity)
-        print("[Data] Normalizing...")
+        # Global Energy Normalization
+        print("[Data] Normalizing Globally...")
         energy_train = np.sum(np.abs(X_train)**2, axis=(1, 2), keepdims=True)
         X_train = X_train / (np.sqrt(energy_train / (CONFIG['sample_len']*2)) + 1e-10)
         
